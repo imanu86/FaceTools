@@ -16,7 +16,9 @@ FaceTools adds direct, face-based mesh editing tools to the Prepare view, aimed 
 
 ## Status and honest limits
 - **Prototype.** It is a mesh-based tool, **not a parametric CAD kernel**: no BRep, no curved-surface editing, no shortening, no general "Move Face".
-- **GUI acceptance is only partial.** Automated tests pass, but the manual GUI scenarios (see [docs/facetools/TEST_CHECKLIST.md](docs/facetools/TEST_CHECKLIST.md)) are not all verified. **"Cut and extend" is known to need more work** on some shapes — expect bugs and always keep a backup of your project.
+- **GUI acceptance is only partial.** Automated tests pass (162 test cases) and "Cut and extend" and the face-plane Cut were verified by hand on a real part, but the other manual scenarios (see [docs/facetools/TEST_CHECKLIST.md](docs/facetools/TEST_CHECKLIST.md)) are not all verified. Expect bugs and always keep a backup of your project.
+- **Cut and extend moves one connected piece.** Guides on two separate pieces are refused ("select one moving component"); run the tool once per piece.
+- **Known upstream issue:** the stock Cut with a numeric plane coincident with an existing face (or within ~0.001 mm) can return a piece with open edges. Pick the plane from the face ("Use guide face as plane") or offset it by at least 0.01 mm.
 - **Printing to a cloud printer is not authorised for forks.** Bambu restricts "Print" for unsigned third-party builds; sending files may work, but direct Print can fail. No attempt is made to bypass this. The proprietary Bambu network plugin is **not** included.
 - macOS arm64 only so far; binaries (if provided) are ad-hoc signed, not notarized.
 
