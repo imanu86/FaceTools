@@ -4,6 +4,8 @@
 #include "slic3r/GUI/GLModel.hpp"
 #include "libslic3r/Point.hpp"
 
+#include <memory>
+
 namespace Slic3r {
 class ModelVolume;
 
@@ -24,13 +26,19 @@ class FacetPicker
 public:
     struct Hit
     {
-        int                facet        = -1;
-        const ModelVolume *volume       = nullptr;
-        Transform3d        trafo        = Transform3d::Identity(); // volume -> world
-        Vec3d              world_pos    = Vec3d::Zero();
-        Vec3d              world_normal = Vec3d::Zero();
+        int                facet             = -1;
+        const ModelVolume *volume            = nullptr;
+        std::shared_ptr<const TriangleMesh> mesh; // immutable source identity and lifetime
+        Transform3d        trafo             = Transform3d::Identity(); // volume -> world
+        Vec3d              world_pos         = Vec3d::Zero(); // approximate ray hit, for display
+        Vec3d              world_plane_point = Vec3d::Zero(); // original triangle vertex, transformed in double
+        Vec3d              world_normal      = Vec3d::Zero();
 
-        bool valid() const { return facet >= 0 && volume != nullptr; }
+        bool valid() const { return facet >= 0 && volume != nullptr && mesh != nullptr; }
+        bool same_geometry(const Hit &other) const {
+            return valid() && other.valid() && volume == other.volume && mesh == other.mesh &&
+                facet == other.facet && (trafo.matrix().array() == other.trafo.matrix().array()).all();
+        }
     };
 
     bool is_active() const { return m_active; }
@@ -48,18 +56,19 @@ public:
 
     const Hit &hit() const { return m_hit; }
 
-    // World-space unit normal of a facet whose mesh-local normal is mesh_normal, for a
-    // volume placed by trafo. Returns zero for a degenerate facet.
-    //
-    // Uses the inverse-transpose of the linear part, not the linear part itself: on a
-    // non-uniformly scaled instance the latter yields a normal that is visibly not
-    // perpendicular to the facet.
-    static Vec3d world_normal(const Transform3d &trafo, const Vec3f &mesh_normal);
+    // Explicit original-facet intent only: never infer a plane from a rounded ray hit.
+    // Invalid indices, vertices, facets or nonfinite/non-affine/singular transforms
+    // return an invalid hit without modifying the source. No GL context is needed.
+    static Hit from_source_facet(const ModelVolume &volume, size_t facet, const Transform3d &world);
+
+    // Inverse-transpose preserves outward orientation under non-uniform scale and
+    // mirrors. Returns zero for an invalid transform or nonfinite/zero normal.
+    static Vec3d world_normal(const Transform3d &trafo, const Vec3d &mesh_normal);
 
 private:
     bool    m_active{false};
     Hit     m_hit;
-    int     m_rendered_facet{-1}; // so the highlight is rebuilt only when the facet changes
+    Hit     m_rendered_hit; // volume + immutable mesh + facet + exact pose, not facet index alone
     GLModel m_highlight;
 };
 

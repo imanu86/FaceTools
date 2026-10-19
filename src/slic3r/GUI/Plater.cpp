@@ -1,4 +1,5 @@
 #include "Plater.hpp"
+#include "ModelObjectLoadPlacement.hpp"
 #include "PerfTrace.hpp"
 #include <array>
 #include <boost/format/format_fwd.hpp>
@@ -65,6 +66,8 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Format/STL.hpp"
+#include "libslic3r/FFFStlExportSafety.hpp"
+#include "libslic3r/CheckedStlExport.hpp"
 #include "libslic3r/Format/STEP.hpp"
 #include "libslic3r/Format/AMF.hpp"
 //#include "libslic3r/Format/3mf.hpp"
@@ -6992,7 +6995,8 @@ public:
     using LoadProgressCallback = std::function<bool(int, const wxString&)>;
     std::vector<size_t> load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi = false);
     std::vector<size_t> load_model_objects(const ModelObjectPtrs& model_objects, bool allow_negative_z = false,
-                                           bool split_object = false, LoadProgressCallback progress_callback = {});
+                                           bool split_object = false, LoadProgressCallback progress_callback = {},
+                                           ModelObjectLoadPlacement placement = ModelObjectLoadPlacement::EnsureOnBed);
 
     struct TextureImportResult {
         Slic3r::PaintedMesh               painted;
@@ -9938,8 +9942,11 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
  #define AUTOPLACEMENT_ON_LOAD
 
 std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& model_objects, bool allow_negative_z,
-                                                     bool split_object, LoadProgressCallback progress_callback)
+                                                     bool split_object, LoadProgressCallback progress_callback,
+                                                     ModelObjectLoadPlacement placement)
 {
+    const wxString placement_message = placement == ModelObjectLoadPlacement::PreserveExisting ?
+        _L("Keeping cut parts in their original position...") : _L("Placing model on the bed...");
     const Vec3d bed_size = Slic3r::to_3d(this->bed.build_volume().bounding_volume2d().size(), 1.0) - 2.0 * Vec3d::Ones();
     auto update_load_progress = [&progress_callback](int percent, const wxString& message) {
         return !progress_callback || progress_callback(std::clamp(percent, 0, 100), message);
@@ -10009,8 +10016,8 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
             }
         }
 
-        object->ensure_on_bed(allow_negative_z);
-        if (!update_load_progress(35, _L("Placing model on the bed...")))
+        apply_model_object_load_placement(*object, allow_negative_z, placement);
+        if (!update_load_progress(35, placement_message))
             return obj_idxs;
         if (!split_object) {
             //BBS initial assemble transformation
@@ -10028,7 +10035,7 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", loaded objects, begin to auto placement");
-    if (!update_load_progress(55, _L("Placing model on the bed...")))
+    if (!update_load_progress(55, placement_message))
         return obj_idxs;
 #ifdef AUTOPLACEMENT_ON_LOAD
 #if 0
@@ -23080,14 +23087,17 @@ void Plater::segment(size_t obj_idx, size_t instance_idx, double smoothing_alpha
     }
 }
 
-void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs &cut_objects)
+void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs &cut_objects, bool cut_to_parts)
 {
     model().delete_object(obj_idx);
     sidebar().obj_list()->delete_object_from_list(obj_idx);
     p->partplate_list.notify_instance_removed(obj_idx, -1);
 
-    // suppress to call selection update for Object List to avoid call of early Gizmos on/off update
-    p->load_model_objects(cut_objects, false, false);
+    // Suppress early selection/gizmo updates. Only the explicit native Cut to
+    // parts operation preserves the existing instance heights, including a
+    // raised or sunk source; ordinary imports and separate-object cuts retain
+    // their established bed-placement behavior.
+    p->load_model_objects(cut_objects, false, false, {}, cut_result_load_placement(cut_to_parts));
 
     // now process all updates of the 3d scene
     update();
@@ -23489,225 +23499,221 @@ TriangleMesh Plater::combine_mesh_fff(const ModelObject& mo, int instance_id, st
     return mesh;
 }
 
-// BBS export with/without boolean, however, stil merge mesh
+// Checked FFF STL export. Legacy assembly/SLA helpers remain independent.
 void Plater::export_stl(bool extended, bool selection_only, bool multi_stls)
 {
-    if (p->model.objects.empty()) { return; }
-
-    wxString path;
-    if (multi_stls) {
-        wxDirDialog dlg(this, _L("Choose a directory"), from_u8(wxGetApp().app_config->get_last_dir()),
-                        wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
-        if (dlg.ShowModal() == wxID_OK) {
-            path = dlg.GetPath() + "/";
-        }
-    } else {
-        path = p->get_export_file(FT_STL);
-    }
-    if (path.empty()) { return; }
-    const std::string path_u8 = into_u8(path);
-
-    wxBusyCursor wait;
-    const auto& selection = p->get_selection();
-
-    //confirm export_with_boolean
-    bool  exist_negive_volume = false;
-    bool  export_with_boolean = false;
-    if (selection_only && !selection.is_multiple_full_object()) {
-        const auto obj_idx = selection.get_object_idx();
-        if (obj_idx == -1 ||selection.is_wipe_tower())
-            return;
-        // only support selection single full object
-        if (!selection.is_single_full_object())
-            return;
-        const ModelObject *cur_model_object = p->model.objects[obj_idx];
-        for (auto v : cur_model_object->volumes) {
-            if (v->type() == ModelVolumeType::NEGATIVE_VOLUME) {
-                exist_negive_volume = true;
-                break;
-            }
-        }
-    } else {//support mulitiple full object// from file mene to export
-        for (auto cur_model_object : p->model.objects) {
-            for (auto v : cur_model_object->volumes) {
-                if (v->type() == ModelVolumeType::NEGATIVE_VOLUME) {
-                    exist_negive_volume = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (exist_negive_volume) {
-        MessageDialog dlg(this, _L("Negative parts detected. Would you like to perform mesh boolean before exporting?"),  _L("Message"),
-                          wxICON_QUESTION | wxYES_NO);
-        int answer = dlg.ShowModal();
-        if (answer == wxID_YES) {
-            export_with_boolean = true;
-        }
-    }
-    // Following lambda generates a combined mesh for export with normals pointing outwards.
-    auto mesh_to_export_fff_no_boolean = [](const ModelObject &mo, int instance_id) {
-        TriangleMesh mesh;
-        for (const ModelVolume *v : mo.volumes)
-            if (v->is_model_part()) {
-                TriangleMesh vol_mesh(v->mesh());
-                vol_mesh.transform(v->get_matrix(), true);
-                mesh.merge(vol_mesh);
-            }
-        if (instance_id == -1) {
-            TriangleMesh vols_mesh(mesh);
-            mesh = TriangleMesh();
-            for (const ModelInstance *i : mo.instances) {
-                TriangleMesh m = vols_mesh;
-                m.transform(i->get_matrix(), true);
-                mesh.merge(m);
-            }
-        } else if (0 <= instance_id && instance_id < int(mo.instances.size()))
-            mesh.transform(mo.instances[instance_id]->get_matrix(), true);
-        return mesh;
-    };
-    auto mesh_to_export_sla = [&, this](const ModelObject& mo, int instance_id) {
-        TriangleMesh mesh;
-
-        const SLAPrintObject *object = this->p->sla_print.get_print_object_by_model_object_id(mo.id());
-
-        if (auto m = object->get_mesh_to_print(); m.empty())
-            mesh = combine_mesh_fff(mo, instance_id, [this](const std::string& msg) {return get_notification_manager()->push_general_error_notification(msg); });
-        else {
-            const Transform3d mesh_trafo_inv = object->trafo().inverse();
-            const bool is_left_handed = object->is_left_handed();
-
-            auto pad_mesh = extended? object->pad_mesh() : TriangleMesh{};
-            pad_mesh.transform(mesh_trafo_inv);
-
-            auto supports_mesh = extended ? object->support_mesh() : TriangleMesh{};
-            supports_mesh.transform(mesh_trafo_inv);
-
-            const std::vector<SLAPrintObject::Instance>& obj_instances = object->instances();
-            for (const SLAPrintObject::Instance& obj_instance : obj_instances) {
-                auto it = std::find_if(object->model_object()->instances.begin(), object->model_object()->instances.end(),
-                                       [&obj_instance](const ModelInstance *mi) { return mi->id() == obj_instance.instance_id; });
-                assert(it != object->model_object()->instances.end());
-
-                if (it != object->model_object()->instances.end()) {
-                    const bool one_inst_only = selection_only && ! selection.is_single_full_object();
-
-                    const int instance_idx = it - object->model_object()->instances.begin();
-                    const Transform3d& inst_transform = one_inst_only
-                                                            ? Transform3d::Identity()
-                                                            : object->model_object()->instances[instance_idx]->get_transformation().get_matrix();
-
-                    TriangleMesh inst_mesh;
-
-                    if (!pad_mesh.empty()) {
-                        TriangleMesh inst_pad_mesh = pad_mesh;
-                        inst_pad_mesh.transform(inst_transform, is_left_handed);
-                        inst_mesh.merge(inst_pad_mesh);
-                    }
-
-                    if (!supports_mesh.empty()) {
-                        TriangleMesh inst_supports_mesh = supports_mesh;
-                        inst_supports_mesh.transform(inst_transform, is_left_handed);
-                        inst_mesh.merge(inst_supports_mesh);
-                    }
-
-                    TriangleMesh inst_object_mesh = object->get_mesh_to_print();
-
-                    inst_object_mesh.transform(mesh_trafo_inv);
-                    inst_object_mesh.transform(inst_transform, is_left_handed);
-
-                    inst_mesh.merge(inst_object_mesh);
-
-                           // ensure that the instance lays on the bed
-                    inst_mesh.translate(0.0f, 0.0f, -inst_mesh.bounding_box().min.z());
-
-                           // merge instance with global mesh
-                    mesh.merge(inst_mesh);
-
-                    if (one_inst_only)
-                        break;
-                }
-            }
-        }
-
-        return mesh;
-    };
-
-    std::function<TriangleMesh(const ModelObject& mo, int instance_id)>
-        mesh_to_export;
-
-    if (p->printer_technology == ptFFF){
-        if (export_with_boolean) {
-             mesh_to_export = [this](const ModelObject& mo, int instance_id) {return Plater::combine_mesh_fff(mo, instance_id,
-                  [this](const std::string& msg) {return get_notification_manager()->push_general_error_notification(msg); }); };
-        } else {
-             mesh_to_export = mesh_to_export_fff_no_boolean;
-        }
-    }
-    else
-        mesh_to_export = mesh_to_export_sla;
-
-    auto get_save_file = [](std::string const & dir, std::string const & name) {
-        auto path = dir + name + ".stl";
-        int n = 1;
-        while (boost::filesystem::exists(path))
-            path = dir + name + "(" + std::to_string(n++) + ").stl";
-        return path;
-    };
-
-    TriangleMesh mesh;
-    if (selection_only) {
-        if (selection.is_single_full_object()) {
-            const auto obj_idx = selection.get_object_idx();
-            const ModelObject* model_object = p->model.objects[obj_idx];
-            if (selection.get_mode() == Selection::Instance)
-                mesh = mesh_to_export(*model_object, (model_object->instances.size() > 1) ? -1 : selection.get_instance_idx());
-            else {
-                const GLVolume* volume = selection.get_volume(*selection.get_volume_idxs().begin());
-                mesh = model_object->volumes[volume->volume_idx()]->mesh();
-                mesh.transform(volume->get_volume_transformation().get_matrix(), true);
-            }
-
-            if (model_object->instances.size() == 1) {
-                //coconut: make the mesh's origin=(0,0,0). origin_translation is useless here.
-                mesh.align_to_origin();//translate(- model_object->origin_translation.cast<float>());
-            }
-        }
-        else if (selection.is_multiple_full_object() && !multi_stls) {
-            const std::set<std::pair<int, int>>& instances_idxs = p->get_selection().get_selected_object_instances();
-            for (const std::pair<int, int>& i : instances_idxs) {
-                ModelObject* object = p->model.objects[i.first];
-                mesh.merge(mesh_to_export(*object, i.second));
-            }
-        }
-        else if (selection.is_multiple_full_object() && multi_stls) {
-            const std::set<std::pair<int, int>> &instances_idxs = p->get_selection().get_selected_object_instances();
-            for (const std::pair<int, int> &i : instances_idxs) {
-                ModelObject *object = p->model.objects[i.first];
-                auto mesh = mesh_to_export(*object, i.second);
-                mesh.translate(-object->origin_translation.cast<float>());
-
-                Slic3r::store_stl(get_save_file(path_u8, object->name).c_str(), &mesh, true);
-            }
-            return;
-        }
-    }
-    else if (!multi_stls) {
-        for (const ModelObject* o : p->model.objects) {
-            mesh.merge(mesh_to_export(*o, -1));
-        }
-    } else {
-        for (const ModelObject* o : p->model.objects) {
-            auto mesh = mesh_to_export(*o, -1);
-            mesh.translate(-o->origin_translation.cast<float>());
-            Slic3r::store_stl(get_save_file(path_u8, o->name).c_str(), &mesh, true);
-        }
+    (void)extended;
+    if (p->model.objects.empty()) return;
+    if (p->printer_technology != ptFFF) {
+        get_notification_manager()->push_general_error_notification(
+            _u8L("Checked STL export currently supports FFF objects only. SLA export is not supported by this path; no file was written."));
         return;
     }
 
-    Slic3r::store_stl(path_u8.c_str(), &mesh, true);
-//    p->statusbar()->set_status_text(format_wxstr(_L("STL file exported to %s"), path));
+    size_t committed_files = 0;
+    const auto report_failure = [&](const std::string &message) {
+        get_notification_manager()->push_general_error_notification(
+            _u8L("STL export stopped. Files already written") + ": " + std::to_string(committed_files) + ". " + message);
+    };
+
+    try {
+        wxString path;
+        if (multi_stls) {
+            wxDirDialog dlg(this, _L("Choose a directory"), from_u8(wxGetApp().app_config->get_last_dir()),
+                            wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+            if (dlg.ShowModal() == wxID_OK) path = dlg.GetPath() + "/";
+        } else {
+            path = p->get_export_file(FT_STL);
+        }
+        // get_export_file uses this sentinel, not just an empty wxString.
+        if (path.empty() || path == "<cancel>") return;
+        const std::string path_u8 = into_u8(path);
+        wxBusyCursor wait;
+        // The legacy filename helper can normalize repeated suffixes AFTER its
+        // native overwrite prompt. Confirm the FINAL returned path independently:
+        // choosing new foo.stl.stl must never silently overwrite existing foo.stl.
+        // A new name remains NoReplace through publication.
+        StlDestinationPolicy single_policy = StlDestinationPolicy::NoReplace;
+        if (!multi_stls) {
+            const auto state = boost::filesystem::symlink_status(path_u8);
+            if (boost::filesystem::is_regular_file(state)) {
+                MessageDialog confirm(this,
+                    _L("The final STL destination already exists:") + "\n" + path + "\n\n" +
+                    _L("Replace this exact file?"), _L("Confirm STL replacement"),
+                    wxICON_WARNING | wxYES_NO | wxNO_DEFAULT);
+                if (confirm.ShowModal() != wxID_YES) return;
+                single_policy = StlDestinationPolicy::ReplaceConfirmedRegularFile;
+            } else if (state.type() != boost::filesystem::file_not_found) {
+                throw std::runtime_error("The STL destination is not a supported regular file path.");
+            }
+        }
+        if (p->model.objects.size() > size_t(std::numeric_limits<int>::max()))
+            throw std::runtime_error("The project exceeds the supported export object count.");
+        auto &selection = p->get_selection();
+        const bool single_object = selection_only && selection.is_single_full_object();
+        const bool multiple_objects = selection_only && selection.is_multiple_full_object();
+        if (selection_only && (selection.is_wipe_tower() || (!single_object && !multiple_objects)))
+            throw std::runtime_error("Select one or more complete objects for this export. The export scope will not be widened automatically.");
+
+        // Resolve exactly the existing full-object/instance selection semantics.
+        // SingleFullObject means ALL of that object's instances, not a partial one
+        // (Selection::update_type enforces this distinction).
+        std::vector<std::pair<int, int>> requests;
+        if (!selection_only) {
+            for (size_t i = 0; i < p->model.objects.size(); ++i) requests.emplace_back(int(i), -1);
+        } else if (single_object) {
+            const int index = selection.get_object_idx();
+            if (index < 0 || size_t(index) >= p->model.objects.size())
+                throw std::runtime_error("The selected object no longer exists.");
+            const ModelObject &object = *p->model.objects[index];
+            requests.emplace_back(index, object.instances.size() > 1 ? -1 : selection.get_instance_idx());
+        } else {
+            const auto &selected = selection.get_selected_object_instances();
+            requests.assign(selected.begin(), selected.end());
+        }
+        if (requests.empty()) throw std::runtime_error("No supported object was selected for export.");
+
+        std::vector<ObjectID> object_ids;
+        object_ids.reserve(p->model.objects.size());
+        for (const ModelObject *object : p->model.objects) object_ids.push_back(object->id());
+        const auto selected_volume_indices = selection.get_volume_idxs();
+        const auto selected_instances = selection.get_selected_object_instances();
+        const auto selection_mode = selection.get_mode();
+        const bool volume_only = single_object && selection_mode != Selection::Instance;
+        if (volume_only && selected_volume_indices.size() != 1)
+            throw std::runtime_error("An explicit volume export must identify exactly one volume; no other selected part will be silently discarded.");
+
+        bool offer_boolean = false;
+        for (const auto &request : requests) {
+            if (request.first < 0 || size_t(request.first) >= p->model.objects.size())
+                throw std::runtime_error("An export object index is invalid.");
+            const ModelObject &object = *p->model.objects[request.first];
+            if (request.second < -1 || (request.second >= 0 && size_t(request.second) >= object.instances.size()))
+                throw std::runtime_error("An export instance index is invalid.");
+            size_t positives = 0;
+            for (const ModelVolume *volume : object.volumes) {
+                if (volume->is_model_part()) ++positives;
+                if (volume->is_negative_volume()) offer_boolean = true;
+            }
+            offer_boolean = offer_boolean || positives > 1;
+        }
+        FffStlExportMode mode = FffStlExportMode::RawPositives;
+        if (offer_boolean && !volume_only) {
+            MessageDialog dlg(this,
+                _L("Use Boolean composition for this STL export?\n\nYes: unite positive parts and subtract negative parts within each object.\nNo: export positive parts without combining them; touching or overlapping shells will be refused.\n\nThe project is not changed. Separate objects and instances are not fused."),
+                _L("STL export geometry"), wxICON_QUESTION | wxYES_NO | wxCANCEL);
+            const int answer = dlg.ShowModal();
+            if (answer != wxID_YES && answer != wxID_NO) return;
+            if (answer == wxID_YES) mode = FffStlExportMode::BooleanPositivesMinusNegatives;
+        }
+        // Never reuse indices from a different project/selection after a modal.
+        if (object_ids.size() != p->model.objects.size())
+            throw std::runtime_error("The project changed during export setup. Please select the export target again.");
+        for (size_t i = 0; i < object_ids.size(); ++i)
+            if (object_ids[i] != p->model.objects[i]->id())
+                throw std::runtime_error("The project changed during export setup. Please select the export target again.");
+        if (selection_only && (selection.get_volume_idxs() != selected_volume_indices ||
+            selection.get_selected_object_instances() != selected_instances || selection.get_mode() != selection_mode ||
+            selection.is_single_full_object() != single_object || selection.is_multiple_full_object() != multiple_objects))
+            throw std::runtime_error("The export selection changed during setup. No file was written.");
+
+        const auto require_geometry = [](const StlGeometryResult &geometry, const std::string &name) {
+            if (geometry.failed()) throw std::runtime_error(name + ": " + geometry.message);
+        };
+        const auto translated = [&](StlGeometryResult geometry, const Vec3d &translation, const std::string &name) {
+            require_geometry(geometry, name);
+            if (geometry.status == StlGeometryStatus::Success) {
+                Transform3d transform = Transform3d::Identity();
+                transform.translation() = translation;
+                geometry = prepare_stl_volume(geometry.mesh.its, {transform});
+                require_geometry(geometry, name);
+            }
+            return geometry;
+        };
+        std::vector<StlGeometryResult> final_geometries;
+        std::vector<std::string> output_names;
+        std::vector<StlGeometryResult> combined_inputs;
+        for (const auto &request : requests) {
+            const ModelObject &object = *p->model.objects[request.first];
+            StlGeometryResult geometry;
+            if (volume_only) {
+                const GLVolume *volume = selection.get_volume(*selected_volume_indices.begin());
+                if (!volume || volume->object_idx() != request.first || volume->volume_idx() < 0 ||
+                    size_t(volume->volume_idx()) >= object.volumes.size())
+                    throw std::runtime_error("The explicitly selected export volume no longer exists.");
+                geometry = prepare_stl_volume(object.volumes[volume->volume_idx()]->mesh().its,
+                    {volume->get_volume_transformation().get_matrix()});
+            } else {
+                geometry = prepare_fff_stl_object(object, request.second, mode);
+            }
+            require_geometry(geometry, object.name); // Failure is never mistaken for an empty Boolean.
+            if (single_object && object.instances.size() == 1 && geometry.status == StlGeometryStatus::Success) {
+                // Preserve align_to_origin semantics, but validate the ACTUAL last
+                // float storage and positional error through the shared producer.
+                const Vec3d translation = -geometry.mesh.bounding_box().min;
+                geometry = translated(std::move(geometry), translation, object.name);
+            } else if (multi_stls) {
+                geometry = translated(std::move(geometry), -object.origin_translation, object.name);
+            }
+            if (single_object || multi_stls) {
+                final_geometries.push_back(std::move(geometry));
+                output_names.push_back(object.name);
+            } else {
+                combined_inputs.push_back(std::move(geometry));
+            }
+        }
+        if (!single_object && !multi_stls) {
+            auto combined = combine_stl_export_results(combined_inputs);
+            require_geometry(combined, "Combined STL");
+            final_geometries.push_back(std::move(combined));
+            output_names.emplace_back("Combined STL");
+        }
+        // Finalize ALL requested meshes AFTER their last transform/merge. Nothing
+        // below (including filename discovery) runs for a failed/empty batch.
+        const auto batch = finalize_stl_export_batch(std::move(final_geometries));
+        if (!batch.ready) throw std::runtime_error(batch.message);
+        for (const PreparedStlOutput &output : batch.outputs)
+            if (output.request_index >= output_names.size())
+                throw std::runtime_error("The prepared STL batch lost its requested output mapping.");
+
+        const auto safe_basename = [](std::string name, size_t index) {
+            // Model names may originate in an imported file, not a save dialog.
+            // Keep UTF-8 and case intact; never let a name escape the chosen dir.
+            for (char &c : name)
+                if (c == '/' || c == '\\' || c == ':' || static_cast<unsigned char>(c) < 32 || c == 127) c = '_';
+            if (name.empty() || name == "." || name == "..") name = "Object " + std::to_string(index + 1);
+            return name;
+        };
+        const auto get_save_file = [](const std::string &directory, const std::string &name) {
+            std::string candidate = directory + name + ".stl";
+            size_t suffix = 1;
+            // Query the actual filesystem after every preceding successful write,
+            // preserving its case/Unicode rules; do not pre-reserve names in a set.
+            while (boost::filesystem::symlink_status(candidate).type() != boost::filesystem::file_not_found)
+                candidate = directory + name + "(" + std::to_string(suffix++) + ").stl";
+            return candidate;
+        };
+        for (const PreparedStlOutput &output : batch.outputs) {
+            const std::string destination = multi_stls ?
+                get_save_file(path_u8, safe_basename(output_names[output.request_index], output.request_index)) : path_u8;
+            const auto written = write_stl_export_atomic(destination, output.mesh.its,
+                multi_stls ? StlDestinationPolicy::NoReplace : single_policy);
+            if (!written.committed) {
+                std::string message = destination + ": " + written.message;
+                if (!written.cleanup_warning.empty()) message += "\n" + written.cleanup_warning;
+                report_failure(message);
+                return;
+            }
+            ++committed_files;
+            if (!written.cleanup_warning.empty())
+                get_notification_manager()->push_general_error_notification(
+                    _u8L("STL saved, but temporary-file cleanup needs attention") + ": " + written.cleanup_warning);
+        }
+    } catch (const std::exception &error) {
+        report_failure(error.what());
+    } catch (...) {
+        report_failure(_u8L("Unexpected STL export failure. No further files were written."));
+    }
 }
 
 //BBS: remove amf export

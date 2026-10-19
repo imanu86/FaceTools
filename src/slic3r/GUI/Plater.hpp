@@ -511,7 +511,7 @@ public:
 
     // BBS: segment model with CGAL
     void segment(size_t obj_idx, size_t instance_idx, double smoothing_alpha=0.5, int segment_number=5);
-    void apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs &cut_objects);
+    void apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs &cut_objects, bool cut_to_parts = false);
     void merge(size_t obj_idx, std::vector<int> &vol_indeces);
 
     void send_to_printer(bool isall = false);

@@ -881,11 +881,11 @@ void PrintJob::process()
         if (use_cloud_error_snapshot && result != BAMBU_NETWORK_ERR_CANCELED)
             restore_cloud_error_info();
 
+        // Preserve the original send failure even if its UI encounters an error.
+        BOOST_LOG_TRIVIAL(error) << "print_job: failed, result = " << result;
         if (result != BAMBU_NETWORK_ERR_CANCELED) {
             this->show_error_info(msg_text, 0, "", "");
         }
-
-        BOOST_LOG_TRIVIAL(error) << "print_job: failed, result = " << result;
     } else {
         // wait for printer mqtt ready the same job id
 

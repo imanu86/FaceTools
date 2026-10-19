@@ -85,6 +85,9 @@ public:
         FuzzySkin,
         Measure,
         Simplify,
+        FaceExtrude,
+        PointProfile,
+        CutAndStretch,
         SlaSupports,
         // BBS
         //FaceRecognition,
@@ -237,6 +240,9 @@ public:
     void update_assemble_view_data();
 
     EType get_current_type() const { return m_current; }
+    bool is_facetools_gizmo() const {
+        return m_current == FaceExtrude || m_current == PointProfile || m_current == CutAndStretch;
+    }
     GLGizmoBase* get_current() const;
     GLGizmoBase *get_gizmo(GLGizmosManager::EType type) const;
     EType get_gizmo_from_name(const std::string& gizmo_name) const;

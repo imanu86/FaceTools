@@ -1561,6 +1561,12 @@ void BooleanOperationEngine::delete_volumes_from_model(const std::vector<ModelVo
     }
 
     if (!items.empty()) {
+        // ObjectList consumes these indices in reverse order. Operand ObjectIDs
+        // do not imply volume-index order (parts may be reordered or IDs renewed).
+        // Sort by object/volume index so earlier deletions cannot shift a later
+        // target onto the Boolean result or an unselected part; remove duplicates.
+        std::sort(items.begin(), items.end());
+        items.erase(std::unique(items.begin(), items.end()), items.end());
         wxGetApp().obj_list()->delete_from_model_and_list(items);
     }
 }

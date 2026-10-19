@@ -4,6 +4,7 @@
 #include "GLGizmoBase.hpp"
 #include "GLGizmoRotate.hpp"
 #include "FacetPicker.hpp"
+#include "NativeCutOutputPolicy.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/CutUtils.hpp"
 
@@ -112,13 +113,7 @@ private:
 
     Vec3d m_drag_pos_start;
 
-    bool m_keep_upper;
-    bool m_keep_lower;
-    bool m_cut_to_parts{false};
-    bool m_place_on_cut_upper{true};
-    bool m_place_on_cut_lower{false};
-    bool m_rotate_upper{false};
-    bool m_rotate_lower{false};
+    NativeCutOutputSettings m_output;
 
     bool m_do_segment;
     double m_segment_smoothing_alpha;
@@ -129,6 +124,8 @@ private:
 
     // Pick-face mode: click a triangular facet of the model to set the cut plane.
     FacetPicker m_facet_picker;
+    bool m_facet_pick_consume_up{false};
+    bool m_facet_pick_left_is_down{false};
 
     bool m_connectors_editing{false};
     bool m_localized_cut_editing = true;
@@ -294,6 +291,7 @@ private:
     bool m_perform_cut_requested { false };
 
     void perform_cut(const Selection& selection);
+    NativeCutOutputContext get_output_context() const;
     bool can_perform_cut() const;
     void apply_connectors_in_model(ModelObject *mo, int &dowels_count);
 

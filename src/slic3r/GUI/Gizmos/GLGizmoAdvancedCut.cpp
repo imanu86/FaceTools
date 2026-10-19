@@ -128,9 +128,6 @@ GLGizmoAdvancedCut::GLGizmoAdvancedCut(GLCanvas3D& parent, unsigned int sprite_i
     : GLGizmoRotate3D(parent, sprite_id, nullptr)
     , m_movement(0.0)
     , m_buffered_movement(0.0)
-    , m_keep_upper(true)
-    , m_keep_lower(true)
-    , m_cut_to_parts(false)
     , m_do_segment(false)
     , m_segment_smoothing_alpha(0.5)
     , m_segment_number(5)
@@ -144,6 +141,20 @@ GLGizmoAdvancedCut::GLGizmoAdvancedCut(GLCanvas3D& parent, unsigned int sprite_i
 
 bool GLGizmoAdvancedCut::gizmo_event(SLAGizmoEventType action, const Vec2d &mouse_position, bool shift_down, bool alt_down, bool control_down)
 {
+    if (action == SLAGizmoEventType::LeftDown)
+        m_facet_pick_consume_up = false;
+    if (m_facet_pick_consume_up) {
+        if (action == SLAGizmoEventType::LeftUp) {
+            // The manager also synthesizes LeftUp when Ctrl starts a camera drag.
+            // Keep ownership until the physical release, even after a one-shot pick.
+            if (!m_facet_pick_left_is_down)
+                m_facet_pick_consume_up = false;
+            return true;
+        }
+        if (action == SLAGizmoEventType::Dragging && m_facet_pick_left_is_down)
+            return true;
+    }
+
     CutConnectors &connectors = m_c->selection_info()->model_object()->cut_connectors;
 
     if (shift_down && !m_connectors_editing &&
@@ -161,6 +172,7 @@ bool GLGizmoAdvancedCut::gizmo_event(SLAGizmoEventType action, const Vec2d &mous
         // gating on m_hover_id made those faces unclickable. gizmo_event runs before the
         // manager's grabber handling, so returning true here suppresses the drag.
         if (m_facet_picker.is_active() && !m_connectors_editing) {
+            m_facet_pick_consume_up = true;
             m_facet_picker.update(mouse_position, m_c, m_parent.get_selection(), wxGetApp().plater()->get_camera());
             if (apply_picked_facet())
                 m_facet_picker.set_active(false); // one-shot: press the button again to pick another
@@ -247,13 +259,15 @@ bool GLGizmoAdvancedCut::on_key(const wxKeyEvent& evt)
 
 std::string GLGizmoAdvancedCut::get_tooltip() const
 {
+    if (m_facet_picker.is_active() && !m_connectors_editing)
+        return _u8L("Click an original model face to set the cut plane. Click Pick face again to cancel.");
     std::string tooltip;
     if (m_dragging && (m_hover_id == c_plate_move_id || m_hover_id == c_cube_z_move_id)) {
         double               koef     = m_imperial_units ? units_mm_to_in : 1.0;
         std::string          unit_str = " " + (m_imperial_units ? _u8L("in") : _u8L("mm"));
         const BoundingBoxf3 &tbb      = m_transformed_bounding_box;
 
-        const std::string name = m_cut_to_parts ? _u8L("Part") : _u8L("Object");
+        const std::string name = m_output.cut_to_parts ? _u8L("Part") : _u8L("Object");
         if (tbb.max.z() >= 0.0) {
             double top = (tbb.min.z() <= 0.0 ? tbb.max.z() : tbb.size().z()) * koef;
             tooltip += format(static_cast<float>(top), 2) + " " + unit_str + " (" + name + " A)";
@@ -391,8 +405,9 @@ bool GLGizmoAdvancedCut::apply_picked_facet()
 
     const Transform3d m = rotation_from_plane_normal(picked.world_normal);
 
-    // Plane lands flush with the facet; the user offsets it afterwards with Movement.
-    const Vec3d new_plane_center = picked.world_pos;
+    // Use a point on the original source triangle, not the approximate float
+    // ray hit. The user can still deliberately offset the plane with Movement.
+    const Vec3d new_plane_center = picked.world_plane_point;
 
     const auto new_tbb = transformed_bounding_box(new_plane_center, m);
 
@@ -419,10 +434,12 @@ bool GLGizmoAdvancedCut::apply_picked_facet()
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Cut plane from face");
 
     m_transformed_bounding_box = new_tbb;
-    set_center(new_plane_center);
     m_start_dragging_m = m_rotate_matrix = m;
     m_plane_normal                       = m_rotate_matrix * Vec3d::UnitZ();
-    m_ar_plane_center                    = m_plane_center;
+    // Dependent connector/clipper updates must see the new orientation as well
+    // as the new center; the matching plane-frame bounds guard above has passed.
+    set_center(new_plane_center);
+    m_ar_plane_center = m_plane_center;
 
     reset_cut_by_contours();
 
@@ -469,13 +486,7 @@ void GLGizmoAdvancedCut::reset_all()
         m_groove.width_tolerance = CUT_TOLERANCE;
     }
     reset_cut_plane();
-    m_keep_upper = true;
-    m_keep_lower = true;
-    m_cut_to_parts = false;
-    m_place_on_cut_upper = true;
-    m_place_on_cut_lower = false;
-    m_rotate_upper = false;
-    m_rotate_lower = false;
+    m_output.reset();
 }
 
 BoundingBoxf3 GLGizmoAdvancedCut::get_bounding_box() const
@@ -594,7 +605,7 @@ void GLGizmoAdvancedCut::on_load(cereal::BinaryInputArchive &ar)
     float  groove_depth_tolerance;
     float  groove_width_tolerance;
 
-    ar(m_keep_upper, m_keep_lower, m_rotate_lower, m_rotate_upper, m_hide_cut_plane, mode, m_connectors_editing, m_ar_plane_center, m_rotate_matrix, groove_depth, groove_width,
+    ar(m_output, m_hide_cut_plane, mode, m_connectors_editing, m_ar_plane_center, m_rotate_matrix, groove_depth, groove_width,
        groove_flaps_angle, groove_angle, groove_depth_tolerance, groove_width_tolerance);
 
     m_start_dragging_m = m_rotate_matrix;
@@ -628,7 +639,7 @@ void GLGizmoAdvancedCut::on_load(cereal::BinaryInputArchive &ar)
 
 void GLGizmoAdvancedCut::on_save(cereal::BinaryOutputArchive &ar) const
 {
-    ar(m_keep_upper, m_keep_lower, m_rotate_lower, m_rotate_upper, m_hide_cut_plane, (size_t) m_cut_mode, m_connectors_editing, m_ar_plane_center, m_start_dragging_m,
+    ar(m_output, m_hide_cut_plane, (size_t) m_cut_mode, m_connectors_editing, m_ar_plane_center, m_start_dragging_m,
        m_groove.depth, m_groove.width, m_groove.flaps_angle, m_groove.angle, m_groove.depth_tolerance, m_groove.width_tolerance);
 }
 
@@ -646,6 +657,9 @@ void GLGizmoAdvancedCut::data_changed(bool is_serializing)
 void GLGizmoAdvancedCut::on_set_state()
 {
     GLGizmoRotate3D::on_set_state();
+    m_facet_pick_consume_up = false;
+    m_facet_pick_left_is_down = false;
+    m_facet_picker.set_active(false);
 
     // Reset m_cut_z on gizmo activation
     if (get_state() == On) {
@@ -657,7 +671,6 @@ void GLGizmoAdvancedCut::on_set_state()
         }
         m_hover_id           = -1;
         m_connectors_editing = false;
-        m_facet_picker.set_active(false);
 
         update_bb();
         reset_cut_plane();//according to boundingbox
@@ -723,7 +736,8 @@ CommonGizmosDataID GLGizmoAdvancedCut::on_get_requirements() const
 {
     return CommonGizmosDataID(int(CommonGizmosDataID::SelectionInfo)
         | int(CommonGizmosDataID::InstancesHider)
-        | int(CommonGizmosDataID::ObjectClipper));
+        | int(CommonGizmosDataID::ObjectClipper)
+        | int(CommonGizmosDataID::Raycaster));
 }
 
 void GLGizmoAdvancedCut::on_start_dragging()
@@ -908,6 +922,9 @@ void GLGizmoAdvancedCut::on_render()
 
 bool GLGizmoAdvancedCut::on_mouse(const wxMouseEvent &mouse_event)
 {
+    // The manager calls this before dispatching gizmo_event, including its
+    // synthetic release during Ctrl-drag. Track the actual button state.
+    m_facet_pick_left_is_down = mouse_event.LeftIsDown();
     if (m_facet_picker.is_active() && !m_connectors_editing) {
         if (mouse_event.Moving() || mouse_event.Dragging()) {
             m_facet_picker.update(Vec2d(mouse_event.GetX(), mouse_event.GetY()), m_c, m_parent.get_selection(),
@@ -1216,8 +1233,9 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
     wxCHECK_RET(instance_idx >= 0 && object_idx >= 0, "GLGizmoAdvancedCut: Invalid object selection");
 
     Plater *     plater = wxGetApp().plater();
-    ModelObject *mo     = plater->model().objects[object_idx];
-    if (!mo) return;
+    if (size_t(object_idx) >= plater->model().objects.size()) return;
+    ModelObject *mo = plater->model().objects[object_idx];
+    if (!mo || size_t(instance_idx) >= mo->instances.size()) return;
 
     // Cutting rebuilds/splits the mesh; painted color, supports, seam and
     // fuzzy-skin may not transfer cleanly. Warn the user when any exist.
@@ -1226,6 +1244,17 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
         if (!wxGetApp().confirm_mesh_paint_warning())
             return;
     }
+
+    // The warning may have pumped events. Revalidate and freeze the effective
+    // output BEFORE closing a gizmo, taking a snapshot, or baking connectors.
+    if (m_state != On || selection.get_object_idx() != object_idx || selection.get_instance_idx() != instance_idx ||
+        size_t(object_idx) >= plater->model().objects.size() || plater->model().objects[object_idx] != mo ||
+        size_t(instance_idx) >= mo->instances.size() || !can_perform_cut())
+        return;
+    const NativeCutOutputSettings output_settings = m_output;
+    NativeCutOutputContext output_context = get_output_context();
+    NativeCutOutputDecision output = resolve_native_cut_output(output_settings, output_context);
+    if (!output.allowed()) return;
 
     // deactivate CutGizmo and than perform a cut
     m_parent.reset_all_gizmos();
@@ -1260,8 +1289,7 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
             m_part_selection.reset(new PartSelection());
         });
 
-        const bool cut_with_groove = m_cut_mode == CutMode::cutTongueAndGroove;
-        bool       cut_by_contour  = !cut_with_groove && m_part_selection->valid() && m_part_selection->has_modified_cut_parts();
+        const bool cut_by_contour = output.route == NativeCutRoute::Contour;
 
         ModelObject *cut_mo = cut_by_contour ? m_part_selection->model_object() : nullptr;
         if (cut_mo)
@@ -1270,24 +1298,22 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
             cut_mo = mo;
 
         int        dowels_count   = 0;
-        const bool has_connectors = !mo->cut_connectors.empty();
         // update connectors pos as offset of its center before cut performing
         apply_connectors_in_model(cut_mo, dowels_count);
 
-        ModelObjectCutAttributes attributes = only_if(has_connectors ? true : m_keep_upper, ModelObjectCutAttribute::KeepUpper) |
-                                              only_if(has_connectors ? true : m_keep_lower, ModelObjectCutAttribute::KeepLower) |
-                                              only_if(has_connectors ? false : m_cut_to_parts, ModelObjectCutAttribute::CutToParts) |
-                                              only_if(m_place_on_cut_upper, ModelObjectCutAttribute::PlaceOnCutUpper) |
-                                              only_if(m_place_on_cut_lower, ModelObjectCutAttribute::PlaceOnCutLower) |
-                                              only_if(m_rotate_upper, ModelObjectCutAttribute::FlipUpper) | only_if(m_rotate_lower, ModelObjectCutAttribute::FlipLower) |
-                                              only_if(dowels_count > 0, ModelObjectCutAttribute::CreateDowels) |
-                                              only_if(!has_connectors && !cut_with_groove && cut_mo->cut_id.id().invalid(), ModelObjectCutAttribute::InvalidateCutInfo);
+        // Only bookkeeping discovered by baking changes after the preflight;
+        // requested output, mode and consumer availability remain frozen.
+        output_context.dowels_count = dowels_count;
+        output_context.cut_id_invalid = cut_mo->cut_id.id().invalid();
+        output = resolve_native_cut_output(output_settings, output_context);
+        assert(output.allowed());
+        ModelObjectCutAttributes attributes = output.attributes;
 
         // update cut_id for the cut object in respect to the attributes
         update_object_cut_id(cut_mo->cut_id, attributes, dowels_count);
 
         Cut cut(cut_mo, instance_idx, get_cut_matrix(selection), attributes);
-        cut.set_offset_for_two_part = true;
+        cut.set_offset_for_two_part = output.separate_half_offset;
 
         // reset_all_gizmos() above posted a CallAfter() that replaces m_part_selection, which owns
         // cut_mo when cutting by contour. The event loop runs while we wait for the worker below, so
@@ -1339,9 +1365,9 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
 
             boost::thread worker_thread([&]() {
                 try {
-                    new_objects_ptr = &(cut_by_contour  ? cut.perform_by_contour(cut_parts, dowels_count) :
-                                        cut_with_groove ? cut.perform_with_groove(groove, rotate_matrix) :
-                                                          cut.perform_with_plane());
+                    new_objects_ptr = &(output.route == NativeCutRoute::Contour ? cut.perform_by_contour(cut_parts, dowels_count) :
+                                        output.route == NativeCutRoute::Groove  ? cut.perform_with_groove(groove, rotate_matrix) :
+                                                                                 cut.perform_with_plane());
                 } catch (std::exception &ex) {
                     cut_error = ex.what();
                 } catch (...) {
@@ -1459,15 +1485,34 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
         // set offset for new_objects
 
         // update cut results on plater and in the model
-        plater->apply_cut_object_to_model(object_idx, new_objects);
+        plater->apply_cut_object_to_model(object_idx, new_objects, output.cut_to_parts());
 
         synchronize_model_after_cut(plater->model(), cut_id);
     }
 }
 
+NativeCutOutputContext GLGizmoAdvancedCut::get_output_context() const
+{
+    NativeCutOutputContext context;
+    context.mode = m_cut_mode;
+    context.has_valid_modified_parts = m_part_selection && m_part_selection->valid() && m_part_selection->has_modified_cut_parts();
+    const Selection &selection = m_parent.get_selection();
+    const Model *model = selection.get_model();
+    const int object_idx = selection.get_object_idx();
+    if (model && object_idx >= 0 && size_t(object_idx) < model->objects.size()) {
+        const ModelObject *object = model->objects[object_idx];
+        if (object) {
+            context.has_connectors = !object->cut_connectors.empty();
+            context.cut_id_invalid = object->cut_id.id().invalid();
+        }
+    }
+    return context;
+}
+
 bool GLGizmoAdvancedCut::can_perform_cut() const
 {
-    if (!m_invalid_connectors_idxs.empty() || (!m_keep_upper && !m_keep_lower) || m_connectors_editing) return false;
+    if (!m_invalid_connectors_idxs.empty() || m_connectors_editing) return false;
+    if (!resolve_native_cut_output(m_output, get_output_context()).allowed()) return false;
 
     if (m_cut_mode == CutMode::cutTongueAndGroove) return has_valid_groove();
 
@@ -2221,11 +2266,9 @@ bool GLGizmoAdvancedCut::is_conflict_for_connector(size_t idx, const CutConnecto
 
 void GLGizmoAdvancedCut::switch_to_mode(CutMode new_mode) {
     m_cut_mode = new_mode;
-    if (m_cut_mode == CutMode::cutTongueAndGroove) {
-        m_cut_to_parts = false;//into Groove function,cancel m_cut_to_parts
-    } else {
+    m_output.on_mode_changed(m_cut_mode);
+    if (m_cut_mode != CutMode::cutTongueAndGroove)
         m_parent.set_use_dovetail_clip(false);
-    }
     if (m_cut_mode != CutMode::cutPlanar)
         m_facet_picker.set_active(false);
     apply_color_clip_plane_colors();
@@ -2652,7 +2695,6 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
     ImGui::Separator();
     m_imgui->disabled_end();
 
-#if 0 // hide Pick-face entry
     // Pick-face mode is planar-cut only; the groove mode has its own plane state machine.
     const bool pick_face_available = (m_cut_mode == CutMode::cutPlanar) && !m_connectors_editing;
     m_imgui->disabled_begin(!pick_face_available);
@@ -2661,8 +2703,16 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
     const bool picking = m_facet_picker.is_active();
     if (picking)
         ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImGuiCol_ButtonActive));
-    if (m_imgui->button(_L("Pick face")))
+    if (m_imgui->button(_L("Pick face"))) {
+        if (!picking && m_c && m_c->raycaster()) {
+            // The shared pool may have last served a tool that includes modifiers.
+            // Refresh once when arming, not on every hover (update shows a busy cursor).
+            m_c->raycaster()->set_only_support_model_part_flag(true);
+            m_c->raycaster()->update();
+        }
         m_facet_picker.set_active(!picking);
+        m_parent.request_extra_frame();
+    }
     if (picking)
         ImGui::PopStyleColor();
     m_imgui->disabled_end();
@@ -2673,7 +2723,6 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
         m_imgui->text(_L("Click a face of the model."));
     }
     ImGui::Separator();
-#endif
 
     ImGui::PushItemWidth(caption_size);
     ImGui::Dummy(ImVec2(caption_size, -1));
@@ -2767,7 +2816,7 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
 
     ImGui::Separator();
     if (m_cut_mode == CutMode::cutPlanar) {
-        m_imgui->disabled_begin(!m_keep_upper || !m_keep_lower || m_cut_to_parts);
+        m_imgui->disabled_begin(!m_output.keep_upper || !m_output.keep_lower || m_output.cut_to_parts);
         if (m_imgui->button(has_connectors ? _L("Edit connectors") : _L("Add connectors")))
             set_connectors_editing(true);
         m_imgui->disabled_end();
@@ -2793,17 +2842,38 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
     }
     ImGui::Separator();
 
-    auto render_part_action_line = [this, space_size,has_connectors](const wxString &label, const wxString &suffix, bool &keep_part, bool &place_on_cut_part, bool &rotate_part) {
+    m_imgui->text(_L("After cut") + ": ");
+    m_output.on_part_assignment_changed(m_part_selection && m_part_selection->has_modified_cut_parts());
+    // Keep this choice available even when its current consumer is unsupported:
+    // an explicit opt-out, not a render side effect, enables separate objects.
+    bool keep_in_place = m_output.cut_to_parts;
+    if (m_imgui->bbl_checkbox(_L("Keep both pieces in place"), keep_in_place)) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Change cut output");
+        m_output.cut_to_parts = keep_in_place;
+    }
+    const float output_text_width = caption_size + 4 * unit_size + 6 * space_size;
+    if (m_output.cut_to_parts)
+        m_imgui->text_wrapped(_L("Both pieces keep their original positions as parts of the same object. Select a child part in the Objects list to move it."), output_text_width);
+    else
+        m_imgui->text_wrapped(_L("Create separate objects. The cut may reposition them for printing."), output_text_width);
+
+    // Widgets edit a copy. Take the snapshot while the real settings still hold
+    // the PRE-change values; the disabled in-place rows display canonical state
+    // without rewriting the user's saved separate-object orientation choices.
+    NativeCutOutputSettings displayed = m_output;
+    displayed.normalize_for_render();
+    bool output_changed = false;
+    auto render_part_action_line = [this, space_size, has_connectors, &displayed, &output_changed](const wxString &label, const wxString &suffix, bool &keep_part, bool &place_on_cut_part, bool &rotate_part) {
         bool keep = true;
-        m_imgui->disabled_begin(has_connectors || m_cut_to_parts);
+        m_imgui->disabled_begin(has_connectors || displayed.cut_to_parts);
         ImGui::AlignTextToFramePadding();
-        auto text = m_cut_to_parts ? _L("Part") : _L("Object") + label;
-        m_imgui->bbl_checkbox(text, has_connectors ? keep : keep_part);
+        auto text = (displayed.cut_to_parts ? _L("Part") : _L("Object")) + " " + label;
+        output_changed |= m_imgui->bbl_checkbox(text + suffix, has_connectors ? keep : keep_part);
 
         float marker_size = m_imgui->calc_text_size(text).y;
         render_color_marker(marker_size, suffix == "##upper" ? UPPER_PART_COLOR : LOWER_PART_COLOR);
         m_imgui->disabled_end();
-        m_imgui->disabled_begin(!keep_part || m_cut_to_parts);
+        m_imgui->disabled_begin(!keep_part || displayed.cut_to_parts);
 
         float text_size = m_imgui->calc_text_size(text).x;
         text_size += m_imgui->scaled(2.5f);
@@ -2812,39 +2882,45 @@ void GLGizmoAdvancedCut::render_cut_plane_input_window(float x, float y, float b
         float new_label_width = checkbox_size + text_size + 2 * space_size;
         ImGui::SameLine(new_label_width);
         bool is_keep = !place_on_cut_part && !rotate_part;
-        if (m_imgui->bbl_checkbox(_L("Keep orientation") + suffix, is_keep)){
+        if (m_imgui->bbl_checkbox(_L("Keep orientation") + suffix, is_keep)) {
             rotate_part       = false;
             place_on_cut_part = false;
+            output_changed = true;
         }
         ImGui::SameLine();
         if (m_imgui->bbl_checkbox(_L("Place on cut") + suffix, place_on_cut_part)) {
-            // in bbl_checkbox have done//place_on_cut_part = !place_on_cut_part;
-            rotate_part       = false;
+            rotate_part = false;
+            output_changed = true;
         }
         ImGui::SameLine();
         if (m_imgui->bbl_checkbox(_L("Flip") + suffix, rotate_part)) {
-            //in bbl_checkbox have done://rotate_part       = !rotate_part;
             place_on_cut_part = false;
+            output_changed = true;
         }
         m_imgui->disabled_end();
     };
 
-    m_imgui->text(_L("After cut") + ": ");
-    render_part_action_line( "A", "##upper", m_keep_upper, m_place_on_cut_upper, m_rotate_upper);
-    render_part_action_line( "B", "##lower", m_keep_lower, m_place_on_cut_lower, m_rotate_lower);
+    render_part_action_line("A", "##upper", displayed.keep_upper, displayed.place_on_cut_upper, displayed.flip_upper);
+    render_part_action_line("B", "##lower", displayed.keep_lower, displayed.place_on_cut_lower, displayed.flip_lower);
+    if (output_changed) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Change cut output");
+        m_output = displayed;
+    }
 
-    if (m_part_selection && m_part_selection->has_modified_cut_parts()) {
-        m_cut_to_parts = false;
+    const NativeCutOutputDecision output = resolve_native_cut_output(m_output, get_output_context());
+    switch (output.block) {
+    case NativeCutOutputBlock::InPlaceWithConnectors:
+        m_imgui->warning_text_wrapped(_L("Keeping both pieces in place is not available with connectors. Remove the connectors, or turn off Keep both pieces in place to create separate objects."), output_text_width);
+        break;
+    case NativeCutOutputBlock::InPlaceWithGroove:
+        m_imgui->warning_text_wrapped(_L("Keeping both pieces in place is not available in Dovetail mode. Choose Planar, or turn off Keep both pieces in place to create separate objects."), output_text_width);
+        break;
+    case NativeCutOutputBlock::InPlaceWithReassignment:
+        m_imgui->warning_text_wrapped(_L("Keeping both pieces in place is not available with reassigned parts. Restore their original side assignments, or turn off Keep both pieces in place to create separate objects."), output_text_width);
+        break;
+    default:
+        break;
     }
-    m_imgui->disabled_begin(has_connectors || (m_part_selection && m_part_selection->has_modified_cut_parts() && m_part_selection->valid()) ||
-                            m_cut_mode == CutMode::cutTongueAndGroove);
-    m_imgui->bbl_checkbox(_L("Cut to parts"), m_cut_to_parts);
-    if (m_cut_to_parts) {
-        m_keep_upper = m_keep_lower = true;
-        m_place_on_cut_upper = m_place_on_cut_lower = false;
-        m_rotate_upper = m_rotate_lower = false;
-    }
-    m_imgui->disabled_end();
 
 #if 0
     // Auto segment input
@@ -3120,7 +3196,7 @@ void GLGizmoAdvancedCut::render_input_window_warning() const
             out += "\n - " + _L("Some connectors are overlapped");
         m_imgui->warning_text(out);
     }
-    if (!m_keep_upper && !m_keep_lower) {
+    if (resolve_native_cut_output(m_output, get_output_context()).block == NativeCutOutputBlock::KeepNeither) {
         m_imgui->warning_text(/*wxString(ImGui::WarningMarkerSmall)*/ _L("Warning") + ": " + _L("Invalid state. \nNo one part is selected to keep after cut"));
     }
 }

@@ -166,6 +166,10 @@ set(lisbslic3r_sources
     Format/STEP.hpp
     Format/STL.cpp
     Format/STL.hpp
+    FFFStlExportSafety.cpp
+    FFFStlExportSafety.hpp
+    CheckedStlExport.cpp
+    CheckedStlExport.hpp
     Format/SL1.hpp
     Format/SL1.cpp
 	Format/svg.hpp
@@ -265,6 +269,16 @@ set(lisbslic3r_sources
     Measure.hpp
     Measure.cpp
     MeasureUtils.hpp
+    FaceExtrusion.hpp
+    FaceExtrusion.cpp
+    PlanarProfile.hpp
+    PlanarProfile.cpp
+    PointAlignment.hpp
+    CutAndStretch.hpp
+    CutAndStretch.cpp
+    CutPlaneSelection.hpp
+    CutGuideSelection.hpp
+    CutGuideSelection.cpp
     CustomGCode.cpp
     CustomGCode.hpp
     Arrange.hpp
@@ -369,6 +383,8 @@ set(lisbslic3r_sources
     TriangleMesh.hpp
     MeshDiagnostics.hpp
     MeshDiagnostics.cpp
+    MeshSolidValidation.hpp
+    MeshSolidValidation.cpp
     MeshRaycast.hpp
     MeshRaycast.cpp
     TriangleMeshDeal.cpp

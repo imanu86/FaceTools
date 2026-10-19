@@ -6,6 +6,18 @@
 #include <boost/log/trivial.hpp>
 
 namespace Slic3r {
+namespace {
+
+struct JobErrorInfo {
+    wxString message;
+    int code;
+    wxString description;
+    wxString extra;
+};
+
+wxDEFINE_EVENT(EVT_JOB_ERROR_INFO, wxThreadEvent);
+
+} // namespace
 
 void GUI::Job::run(std::exception_ptr &eptr)
 {
@@ -37,13 +49,26 @@ void GUI::Job::update_percent_finish()
 
 void GUI::Job::show_error_info(wxString msg, int code, wxString description, wxString extra)
 {
-    m_progress->show_error_info(msg, code, description, extra);
+    // Like progress updates, errors originate in process() on the worker.
+    // Queue owned data on this Job, not an app-level callback that could
+    // outlive the dialog. wxEvtHandler discards its pending events on teardown.
+    auto evt = new wxThreadEvent(EVT_JOB_ERROR_INFO);
+    evt->SetPayload(JobErrorInfo{msg.Clone(), code, description.Clone(), extra.Clone()});
+    wxQueueEvent(this, evt);
 }
 
 GUI::Job::Job(std::shared_ptr<ProgressIndicator> pri)
     : m_progress(std::move(pri))
 {
     m_thread_evt_id = wxNewId();
+
+    Bind(EVT_JOB_ERROR_INFO, [this](const wxThreadEvent &evt) {
+        if (was_canceled()) return;
+        // Do not suppress errors merely because progress reached 100%:
+        // waiting for the printer can still fail after that update.
+        const auto error = evt.GetPayload<JobErrorInfo>();
+        m_progress->show_error_info(error.message, error.code, error.description, error.extra);
+    });
 
     Bind(wxEVT_THREAD, [this](const wxThreadEvent &evt) {
         if (m_finalizing)  return;

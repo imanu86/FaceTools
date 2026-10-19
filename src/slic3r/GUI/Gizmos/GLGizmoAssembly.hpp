@@ -2,6 +2,8 @@
 #define slic3r_GLGizmoAssembly_hpp_
 
 #include "GLGizmoMeasure.hpp"
+#include "libslic3r/PointAlignment.hpp"
+#include <array>
 
 namespace Slic3r {
 
@@ -16,7 +18,7 @@ public:
     /// </summary>
     /// <param name="mouse_event">Keep information about mouse click</param>
     /// <returns>Return True when use the information otherwise False.</returns>
-    //bool on_mouse(const wxMouseEvent &mouse_event) override;
+    bool on_mouse(const wxMouseEvent &mouse_event) override;
     //void data_changed(bool is_serializing) override;
     //bool gizmo_event(SLAGizmoEventType action, const Vec2d &mouse_position, bool shift_down, bool alt_down, bool control_down) override;
 
@@ -38,6 +40,24 @@ protected:
     bool render_assembly_mode_combo(double label_width, float item_width);
 
     void switch_to_mode(AssemblyMode new_mode);
+
+private:
+    bool is_prepare_point_mode() const;
+    static bool same_point_pick(const SelectedFeatures::Item &a, const SelectedFeatures::Item &b);
+    bool resolve_point_pick(const SelectedFeatures::Item &item, PointAlignmentAnchor &anchor,
+                            GLVolume *&volume, std::string &reason) const;
+    bool sync_point_anchors(std::string &reason);
+    bool point_scene_is_current(std::string &reason) const;
+    std::optional<Vec3d> show_prepare_point_alignment();
+    void apply_point_alignment(const Vec3d &gap_mm);
+
+    SelectedFeatures m_alignment_picks;
+    std::array<std::optional<PointAlignmentAnchor>, 2> m_point_anchors;
+    std::array<GLVolume *, 2> m_point_volumes{{nullptr, nullptr}};
+    Vec3d m_point_gap_buffer = Vec3d::Zero();
+    bool m_point_buffer_initialized = false;
+    bool m_point_buffer_inches = false;
+    std::string m_point_message;
 };
 
 } // namespace GUI

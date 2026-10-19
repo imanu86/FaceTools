@@ -1133,6 +1133,8 @@ void SelectMachineDialog::prepare_mode(bool refresh_button)
 
     m_is_in_sending_mode = false;
     if (m_print_job) {
+        // Invalidate pending errors before resetting the reusable dialog.
+        m_print_job->cancel();
         m_print_job->join();
     }
 
@@ -2078,10 +2080,9 @@ void SelectMachineDialog::on_cancel(wxCloseEvent &event)
         m_mapping_popup.Dismiss();
 
     if (m_print_job) {
-        if (m_print_job->is_running()) {
-            m_print_job->cancel();
-            m_print_job->join();
-        }
+        // A finished worker may still have UI events queued for this dialog.
+        m_print_job->cancel();
+        m_print_job->join();
     }
     this->EndModal(wxID_CANCEL);
 }
@@ -3223,8 +3224,8 @@ void SelectMachineDialog::on_send_print()
         if (m_print_job) {
             if (m_print_job->is_running()) {
                 BOOST_LOG_TRIVIAL(info) << "print_job: canceled";
-                m_print_job->cancel();
             }
+            m_print_job->cancel();
             m_print_job->join();
         }
         m_is_canceled = true;
@@ -5514,6 +5515,13 @@ bool SelectMachineDialog::Show(bool show)
 
 SelectMachineDialog::~SelectMachineDialog()
 {
+    // Always join: is_running() may already be false while the worker is
+    // still enqueueing its terminal event. Controls remain alive until then.
+    if (m_print_job) {
+        m_print_job->cancel();
+        m_print_job->join();
+        m_print_job.reset();
+    }
     delete m_refresh_timer;
 }
 

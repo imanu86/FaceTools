@@ -467,6 +467,12 @@ void CGALMeshDeleter::operator()(CGALMesh *ptr) { delete ptr; }
 
 bool does_bound_a_volume(const CGALMesh &mesh)
 {
+    // is_closed() only examines halfedges. An isolated vertex can therefore
+    // pass that check, while CGAL's volume predicate dereferences its null
+    // halfedge. Reject it for every caller; never silently drop input vertices.
+    for (const auto vertex : mesh.m.vertices())
+        if (mesh.m.halfedge(vertex) == _EpicMesh::null_halfedge())
+            return false;
     return CGAL::is_closed(mesh.m) && CGALProc::does_bound_a_volume(mesh.m);
 }
 

@@ -25,6 +25,7 @@
 #include "slic3r/GUI/Gizmos/GLGizmoMmuSegmentation.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoFuzzySkin.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSimplify.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoFaceExtrude.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoText.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSVG.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMeshBoolean.hpp"
@@ -118,6 +119,12 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoFuzzySkin(m_parent, EType::FuzzySkin));
     m_gizmos.emplace_back(new GLGizmoMeasure(m_parent, EType::Measure));
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, EType::Simplify));
+    m_gizmos.emplace_back(new GLGizmoFaceExtrude(m_parent, EType::FaceExtrude));
+    m_gizmos.emplace_back(new GLGizmoFaceExtrude(m_parent, EType::PointProfile,
+                                               GLGizmoFaceExtrude::ToolMode::PointProfile));
+    m_gizmos.emplace_back(new GLGizmoFaceExtrude(m_parent, EType::CutAndStretch,
+                                               GLGizmoFaceExtrude::ToolMode::CutAndStretch));
+    assert(m_gizmos.size() == static_cast<size_t>(EType::SlaSupports));
 
     //m_gizmos.emplace_back(new GLGizmoSlaSupports(m_parent, sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoFaceDetector(m_parent, sprite_id++));
@@ -587,7 +594,8 @@ bool GLGizmosManager::is_gizmo_activable_when_single_full_instance()
         get_current_type() == GLGizmosManager::EType::MeshBoolean ||
         get_current_type() == GLGizmosManager::EType::Text ||
         is_paint_gizmo() ||
-        get_current_type() == GLGizmosManager::EType::Simplify
+        get_current_type() == GLGizmosManager::EType::Simplify ||
+        is_facetools_gizmo()
         ) {
         return true;
     }
@@ -600,6 +608,7 @@ bool GLGizmosManager::is_gizmo_click_empty_not_exit()
        get_current_type() == GLGizmosManager::EType::MeshBoolean ||
        is_paint_gizmo() ||
        get_current_type() == GLGizmosManager::EType::Measure ||
+       is_facetools_gizmo() ||
        get_current_type() == GLGizmosManager::EType::Assembly) {
         return true;
     }
@@ -739,13 +748,13 @@ bool GLGizmosManager::is_allow_show_volume_highlight_outline() const
 
 bool GLGizmosManager::is_allow_drag_volume() const
 {
-    if (m_current == EType::Cut) { return false; }
+    if (m_current == EType::Cut || is_facetools_gizmo()) { return false; }
     return true;
 }
 
 bool GLGizmosManager::is_allow_mouse_drag_selected() const
 {
-    if (m_current == Measure || m_current == Assembly)
+    if (m_current == Measure || m_current == Assembly || is_facetools_gizmo())
         return false;
     return true;
 }
@@ -867,6 +876,10 @@ bool GLGizmosManager::on_mouse(wxMouseEvent& evt)
 
     // when control is down we allow scene pan and rotation even when clicking over some object
     bool control_down = evt.CmdDown();
+    // FaceTools variants own their face/point picking (not native grabber drags).
+    // Honor the consumed flag so the canvas cannot also select/move the object.
+    if (is_facetools_gizmo())
+        return m_gizmos[m_current]->on_mouse(evt);
     if (m_current != Undefined) {
         // check if gizmo override method could be slower than simple call virtual function
         // &m_gizmos[m_current]->on_mouse != &GLGizmoBase::on_mouse &&
@@ -1132,7 +1145,7 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
         case WXK_ESCAPE:
         {
             if (m_current != Undefined) {
-                if ((m_current == Measure || m_current == Assembly) && gizmo_event(SLAGizmoEventType::Escape)) {
+                if ((m_current == Measure || m_current == Assembly || is_facetools_gizmo()) && gizmo_event(SLAGizmoEventType::Escape)) {
                     // do nothing
                 } else if ((m_current != SlaSupports && m_current != BrimEars) || !gizmo_event(SLAGizmoEventType::DiscardChanges))
                     reset_all_states();
@@ -1152,7 +1165,7 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
         }
         //case WXK_BACK:
         case WXK_DELETE: {
-            if ((m_current == Cut || m_current == Measure || m_current == Assembly || m_current == BrimEars) && gizmo_event(SLAGizmoEventType::Delete))
+            if ((m_current == Cut || m_current == Measure || m_current == Assembly || m_current == BrimEars || is_facetools_gizmo()) && gizmo_event(SLAGizmoEventType::Delete))
                 processed = true;
             break;
         }
@@ -1513,6 +1526,12 @@ std::string GLGizmosManager::convert_gizmo_type_to_string(Slic3r::GUI::GLGizmosM
         return "Assembly";
     case Slic3r::GUI::GLGizmosManager::EType::Simplify:
         return "Simplify";
+    case Slic3r::GUI::GLGizmosManager::EType::FaceExtrude:
+        return "FaceExtrude";
+    case Slic3r::GUI::GLGizmosManager::EType::PointProfile:
+        return "PointProfile";
+    case Slic3r::GUI::GLGizmosManager::EType::CutAndStretch:
+        return "CutAndStretch";
     case Slic3r::GUI::GLGizmosManager::EType::BrimEars:
         return "BrimEars";
     case Slic3r::GUI::GLGizmosManager::EType::SlaSupports:

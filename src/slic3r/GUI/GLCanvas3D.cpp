@@ -6953,6 +6953,9 @@ void GLCanvas3D::export_toolpaths_to_obj(const char* filename) const
 
 void GLCanvas3D::mouse_up_cleanup()
 {
+    // Gizmos may consume button-up before the normal orbit-release branch.
+    // Do not carry its pivot into the next camera gesture after a pan.
+    m_rotation_center = Vec3d::Zero();
     m_moving = false;
     m_mouse.drag.move_volume_idx = -1;
     m_mouse.set_start_position_3D_as_invalid();
