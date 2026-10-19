@@ -1,7 +1,3 @@
-// Copyright (C) 2026 Emmanuele Semprini
-// SPDX-License-Identifier: AGPL-3.0-only
-// Part of FaceTools, an unofficial modification of Bambu Studio (AGPL-3.0).
-
 #include "GLGizmoFaceExtrude.hpp"
 #include "FaceToolsPreviewBounds.hpp"
 
@@ -3242,6 +3238,14 @@ void GLGizmoFaceExtrude::start_boolean(bool prepare_stretch)
             // atomic cancel flag cross into this worker. No Model/GUI pointers.
             const auto canceled = [&] { return request->cancel.load(std::memory_order_relaxed) || ctl.was_canceled(); };
             const auto check_cancel = [&] { if (canceled()) throw BooleanCanceled{}; };
+            // Every exit (success, rejected plan, cancellation or exception) must
+            // close the progress notification. Early returns after request->error
+            // used to leave it frozen at the last reported percentage (e.g. 36%)
+            // with the Stop button still shown although the job had finished.
+            struct CloseProgress {
+                JobNew::Ctl &ctl; const decltype(request->status) &status;
+                ~CloseProgress() { try { ctl.update_status(100, status); } catch (...) {} }
+            } close_progress{ctl, request->status};
             try {
                 check_cancel();
                 TriangleMesh current;
