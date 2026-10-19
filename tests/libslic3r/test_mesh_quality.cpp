@@ -1,7 +1,3 @@
-// Copyright (C) 2026 Emmanuele Semprini
-// SPDX-License-Identifier: AGPL-3.0-only
-// Part of FaceTools, an unofficial modification of Bambu Studio (AGPL-3.0).
-
 #include <catch2/catch.hpp>
 
 #include "libslic3r/FaceExtrusion.hpp"
@@ -449,4 +445,52 @@ TEST_CASE("Mesh quality CGAL volume guard safely rejects an unused outside verte
           "[mesh_quality][mesh_quality_orphan_cgal][mesh_quality_orphan_outside]")
 {
     require_cgal_orphan_rejection(Vec3f(20, 20, 20));
+}
+
+namespace Slic3r { std::vector<Vec3d> its_reversed_face_ray_directions(); }
+
+TEST_CASE("Reversed-face ray set avoids axis, diagonal and symmetry planes", "[mesh_quality][reversed_faces]")
+{
+    // Regression: axis-aligned rays on mirror-symmetric parts could run inside a
+    // symmetry plane / along triangle edges, drop a crossing and make the
+    // outermost hit a back face, flagging a valid solid as reversed (Cut and
+    // extend then failed at specific distances with a Boolean-validity error).
+    const std::vector<Vec3d> dirs = Slic3r::its_reversed_face_ray_directions();
+    REQUIRE(dirs.size() == 46);
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        CHECK(dirs[i].norm() == Approx(1.0));
+        for (int a = 0; a < 3; ++a) {
+            CHECK(std::abs(dirs[i][a]) > 1e-3);                   // not inside any axis plane
+            for (int b = a + 1; b < 3; ++b)
+                CHECK(std::abs(std::abs(dirs[i][a]) - std::abs(dirs[i][b])) > 1e-3); // not on a diagonal plane
+        }
+        for (size_t j = i + 1; j < dirs.size(); ++j)
+            CHECK(dirs[i].dot(dirs[j]) < 1.0 - 1e-9);             // no duplicate rays (opposite rays are intended)
+    }
+}
+
+TEST_CASE("Mirror-symmetric solids with raised ridges are never flagged as reversed", "[mesh_quality][reversed_faces]")
+{
+    const auto box = [](Vec3d lo, Vec3d hi) {
+        indexed_triangle_set m = its_make_cube(hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z());
+        its_translate(m, lo.cast<float>());
+        return TriangleMesh(std::move(m));
+    };
+    int checked = 0;
+    for (double h = 8.0; h <= 30.0; h += 0.5)
+        for (double hb = 8.0; hb <= 30.0; hb += 3.5) {
+            TriangleMesh part = box({-44.15, -115.8, 0.0}, {44.15, 115.8, 3.0});
+            MeshBoolean::cgal::plus(part, box({-25.0, -112.6, 2.9}, {25.0, -108.8, h}));
+            MeshBoolean::cgal::plus(part, box({-25.0, 3.2, 2.9}, {25.0, 7.0, hb}));
+            const MeshDiagnosticStats stats = its_mesh_diagnostics(part.its);
+            INFO("h=" << h << " hb=" << hb);
+            CHECK(!stats.has_reversed_faces);
+            ++checked;
+        }
+    REQUIRE(checked > 100);
+
+    // The check must still catch a really inside-out solid.
+    TriangleMesh flipped = box({-44.15, -115.8, 0.0}, {44.15, 115.8, 21.0});
+    its_flip_triangles(flipped.its);
+    CHECK(its_mesh_diagnostics(flipped.its).has_reversed_faces);
 }

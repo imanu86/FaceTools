@@ -3,6 +3,7 @@
 #include "Point.hpp"
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,40 @@
 #include <tbb/parallel_sort.h>
 
 namespace Slic3r {
+
+std::vector<Vec3d> its_reversed_face_ray_directions()
+{
+    std::vector<Vec3d> dirs;
+    dirs.reserve(46);
+    for (int x = -1; x <= 1; ++x)
+        for (int y = -1; y <= 1; ++y)
+            for (int z = -1; z <= 1; ++z) {
+                if (x == 0 && y == 0 && z == 0)
+                    continue;
+                dirs.emplace_back(double(x), double(y), double(z));
+            }
+    constexpr int    extra  = 20;
+    constexpr double golden = 2.399963229728653;
+    for (int i = 0; i < extra; ++i) {
+        const double y   = 1.0 - 2.0 * (i + 0.5) / extra;
+        const double r   = std::sqrt(std::max(0.0, 1.0 - y * y));
+        const double phi = i * golden;
+        dirs.emplace_back(r * std::cos(phi), y, r * std::sin(phi));
+    }
+    // The lattice and spiral directions above are aligned with the global axes.
+    // On mirror-symmetric parts (almost every plug, box or bracket) such rays can
+    // run exactly inside a symmetry plane, along triangle edges or cap diagonals;
+    // the raycaster then drops or duplicates a crossing, an inner back-facing hit
+    // becomes the "outermost" one and a valid solid is flagged as reversed. A
+    // fixed, generic rotation keeps the test deterministic while moving every ray
+    // off such coincidences.
+    const Eigen::Matrix3d generic_rotation =
+        Eigen::AngleAxisd(0.41421356237, Vec3d(0.3711, 0.6124, 0.6988).normalized()).toRotationMatrix();
+    for (Vec3d &d : dirs)
+        d = (generic_rotation * d).normalized();
+    return dirs;
+}
+
 
 namespace {
 
@@ -126,23 +161,7 @@ static bool detect_visible_backfaces(const indexed_triangle_set &its)
 
     const TriangleRaycaster caster(its);
 
-    std::vector<Vec3d> dirs;
-    dirs.reserve(46);
-    for (int x = -1; x <= 1; ++x)
-        for (int y = -1; y <= 1; ++y)
-            for (int z = -1; z <= 1; ++z) {
-                if (x == 0 && y == 0 && z == 0)
-                    continue;
-                dirs.emplace_back(double(x), double(y), double(z));
-            }
-    constexpr int    extra  = 20;
-    constexpr double golden = 2.399963229728653;
-    for (int i = 0; i < extra; ++i) {
-        const double y   = 1.0 - 2.0 * (i + 0.5) / extra;
-        const double r   = std::sqrt(std::max(0.0, 1.0 - y * y));
-        const double phi = i * golden;
-        dirs.emplace_back(r * std::cos(phi), y, r * std::sin(phi));
-    }
+    const std::vector<Vec3d> dirs = its_reversed_face_ray_directions();
 
     constexpr double graze           = 0.08;
     constexpr double backface        = 1e-4;
