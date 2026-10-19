@@ -1,0 +1,9 @@
+FaceTools is an unofficial modification of Bambu Studio (https://github.com/bambulab/BambuStudio),
+licensed under the GNU Affero General Public License v3.0 (see LICENSE).
+
+Bambu Studio is derived from PrusaSlicer (Prusa Research) and Slic3r (Alessandro Ranellucci).
+Copyright of the original authors is retained in all upstream files; third-party libraries in
+src/ and deps/ keep their own licenses. FaceTools additions: Copyright (C) 2026 Emmanuele Semprini.
+
+"Bambu Studio" and "Bambu Lab" are trademarks of their owners. This project is not affiliated with,
+endorsed or supported by Bambu Lab. The proprietary Bambu network plug-in is NOT included.
