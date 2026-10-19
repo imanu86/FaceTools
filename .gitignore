@@ -42,3 +42,13 @@ compile_commands.json
 resources/web/device_page/assets/
 resources/web/device_page/index.html
 
+# Local FaceTools artifacts and private runtime data (never version these).
+/result.json
+/configuration/
+*.app/
+*.bundle-backup/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+
